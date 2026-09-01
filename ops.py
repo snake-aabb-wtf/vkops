@@ -80,7 +80,13 @@ class GPU:
         return buf.np(np.float32, count=int(np.prod(shape))).reshape(shape).copy()
 
     # -- pipelines ----------------------------------------------------------
+    FP16_PIPELINES = ("gemm_fp16", "cvt_f32_f16")
+
     def _pipeline(self, name, nbind):
+        if name in self.FP16_PIPELINES and not self.dev.fp16_enabled:
+            raise RuntimeError(
+                f"pipeline '{name}' requires shaderFloat16 + storageBuffer16BitAccess "
+                f"(unsupported on {self.dev.device_name})")
         p = self.pipelines.get(name)
         if p is None:
             p = self.dev.make_pipeline(_load_shader(name), nbind)

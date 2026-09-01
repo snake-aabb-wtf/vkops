@@ -408,7 +408,6 @@ class VulkanDevice:
         app = VkApplicationInfo()
         app.sType = ST_APPLICATION_INFO
         app.pApplicationName = b"vkops"
-        app.apiVersion = API_VERSION_1_3
         ici = VkInstanceCreateInfo()
         ici.sType = ST_INSTANCE_CREATE_INFO
         ici.pApplicationInfo = ctypes.pointer(app)
@@ -420,7 +419,14 @@ class VulkanDevice:
             ici.enabledLayerCount = len(layers)
             ici.ppEnabledLayerNames = pp
         self.instance = H()
-        _check(F["vkCreateInstance"][0](ctypes.byref(ici), None, ctypes.byref(self.instance)), "vkCreateInstance")
+        # request the newest API we can; fall back on very old loaders
+        err = None
+        for api in (API_VERSION_1_3, (1 << 22) | (2 << 12), (1 << 22) | (1 << 12)):
+            app.apiVersion = api
+            err = F["vkCreateInstance"][0](ctypes.byref(ici), None, ctypes.byref(self.instance))
+            if err == 0:
+                break
+        _check(err, "vkCreateInstance")
 
         n = ctypes.c_uint32(0)
         _check(F["vkEnumeratePhysicalDevices"][0](self.instance, ctypes.byref(n), None), "vkEnumeratePhysicalDevices")
@@ -437,8 +443,9 @@ class VulkanDevice:
             F["vkGetPhysicalDeviceProperties"][0](pd, ctypes.cast(buf, H))
             b = ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint32))
             dev_type = b[4]
+            api_version = b[0]
             name = buf.raw[20:20 + 256].split(b"\x00")[0].decode("utf-8", "replace")
-            info = (pd, dev_type, name)
+            info = (pd, dev_type, name, api_version)
             if fallback is None:
                 fallback = info
             if dev_type == PHYS_DEVICE_TYPE_INTEGRATED:
@@ -449,7 +456,7 @@ class VulkanDevice:
         info = best or fallback
         if info is None:
             raise VulkanError("no Vulkan physical device found")
-        self.physical_device, self.device_type, self.device_name = info
+        self.physical_device, self.device_type, self.device_name, self.api_version = info
         if prefer_integrated and best is None:
             pass  # keep fallback anyway
 
@@ -498,7 +505,12 @@ class VulkanDevice:
         f2q.pNext = ctypes.addressof(f16q)
         f16q.pNext = ctypes.addressof(b16q)
         self.call("vkGetPhysicalDeviceFeatures2", self.physical_device, ctypes.byref(f2q))
-        self.fp16_enabled = bool(f16q.shaderFloat16) and bool(b16q.storageBuffer16BitAccess)
+        api_maj = self.api_version >> 22
+        api_min = (self.api_version >> 12) & 0x3FF
+        # feature structs are core since Vulkan 1.2; on older devices we would
+        # need the VK_KHR_* extension names enabled, so require 1.2 for FP16.
+        self.fp16_enabled = (api_maj, api_min) >= (1, 2) and \
+            bool(f16q.shaderFloat16) and bool(b16q.storageBuffer16BitAccess)
         self._fp16_dev_structs = None
         if self.fp16_enabled:
             f16e = VkPhysicalDeviceShaderFloat16Int8Features()
@@ -569,13 +581,22 @@ class VulkanDevice:
     def compile_spirv(self, glsl_src):
         if not self._glslc:
             raise VulkanError("glslc not found (Vulkan SDK required on this machine)")
-        key = hashlib.sha1(glsl_src.encode()).hexdigest()[:16]
+        api_maj = self.api_version >> 22
+        api_min = (self.api_version >> 12) & 0x3FF
+        if (api_maj, api_min) >= (1, 3):
+            target_env = "vulkan1.3"
+        elif (api_maj, api_min) >= (1, 2):
+            target_env = "vulkan1.2"
+        else:
+            target_env = "vulkan1.1"
+        # cache key includes the target env: same source, different SPIR-V per API version
+        key = hashlib.sha1((target_env + "|" + glsl_src).encode()).hexdigest()[:16]
         out = os.path.join(self._spv_cache_dir, key + ".spv")
         if not os.path.exists(out):
             src = out + ".comp"
             with open(src, "w", encoding="utf-8") as f:
                 f.write(glsl_src)
-            r = subprocess.run([self._glslc, "-O", "--target-env=vulkan1.3", "-o", out, src],
+            r = subprocess.run([self._glslc, "-O", f"--target-env={target_env}", "-o", out, src],
                                capture_output=True)
             if r.returncode != 0:
                 raise VulkanError("glslc error:\n" + r.stdout.decode("utf-8", "replace") + r.stderr.decode("utf-8", "replace"))
@@ -720,8 +741,11 @@ class VulkanDevice:
         _check(F["vkQueueWaitIdle"][0](self.queue), "vkQueueWaitIdle")
 
     def info(self):
-        return (f"{self.device_name} (type={self.device_type}, queue_family={self.queue_family}, "
-                f"mem_type={self.memtype_default})")
+        api_maj = self.api_version >> 22
+        api_min = (self.api_version >> 12) & 0x3FF
+        return (f"{self.device_name} (api={api_maj}.{api_min}, type={self.device_type}, "
+                f"queue_family={self.queue_family}, mem_type={self.memtype_default}, "
+                f"fp16={self.fp16_enabled})")
 
 
 # minimal struct for shader module creation (separate sType value space is fine — same enum)
