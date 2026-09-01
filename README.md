@@ -65,19 +65,42 @@ To try it you need the weights: grab `model.safetensors` from
 hf-mirror), plus `tokenizer.json` from the same repo. The scripts read only
 a small subset of tensors, so a subset file works too.
 
+## Real chat: dense Qwen3-4B on the same engine
+
+`chat.py` + `gen_chat.py` scale the same engine to a full dense model
+(Huihui-Qwen3-4B-Instruct-2507-abliterated, 4B params, bf16 -> fp16, 8 GB):
+
+```
+你> 你好！请用两三句话介绍一下你自己。
+你好！我是通义千问（Qwen），是阿里巴巴集团旗下的通义实验室自主研发的
+超大规模语言模型，能够回答问题、创作文字、进行逻辑推理和编程等。...
+[gen] 65 tokens in 41.8s -> 1.6 tok/s
+```
+
+Self-test on real weights: GPU vs numpy reference top-10 logits **10/10
+identical** (rel err 2.2e-3); the KV-cache path matches full prefill
+(1.6e-3). Decode is bandwidth-bound (~7.5 GB of weights streamed per token
+at ~33 GB/s) plus per-op submit overhead. `downloader.py` parallel-fetches
+the weights from hf-mirror with resumable chunked range requests (16
+streams, sha256-verified against the Hub's LFS oids). The streaming loader
+converts bf16 -> f16 per tensor (mmap + slice), so the model never
+materializes as f32 in RAM.
+
 ## Layout
 
 ```
 vk.py               ctypes bindings to vulkan-1.dll (device/pipeline/dispatch core)
 ops.py              tensor-level operator API + FFN blocks
+chat.py             streaming loader + KV-cache chat engine (dense Qwen3)
 st.py               safetensors reader/writer (pure numpy)
 shaders/*.comp      GLSL compute shaders (compiled at runtime via glslc)
 test_ops.py         numeric verification vs numpy + benchmarks
-bench_*.py          per-optimization benchmarks (v2, ffn, fp16)
-probe_perf.py       device roofline probes (features / bandwidth / FMA peak)
-debug_pool.py       descriptor pool isolation test
+gen_chat.py         real chat CLI on Qwen3-4B-Instruct (KV cache, chat template)
 gen_gibberish.py    7-layer Qwen3-0.6B text generation demo
 real_model_test.py  single-layer FFN on real Qwen3 weights
+downloader.py       parallel resumable hf-mirror fetcher (curl ranges, sha256)
+probe_perf.py       device roofline probes (features / bandwidth / FMA peak)
+debug_pool.py       descriptor pool isolation test
 deploy.py           SFTP deployment to a target machine (env-var credentials)
 AGENTS.md           notes for AI coding agents working on this repo
 ```
