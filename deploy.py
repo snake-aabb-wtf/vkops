@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""deploy.py — push this repo's sources to the target machine via SFTP.
+"""deploy.py — push this repo's sources to a target machine via SFTP.
 
-Credentials come from the environment (never hardcoded):
-  VKOPS_SSH_HOST (default 100.105.188.76)
-  VKOPS_SSH_USER (default administrator)
-  VKOPS_SSH_PASS (required)
+All connection details come from the environment (never hardcoded):
+  VKOPS_SSH_HOST  target host (e.g. a Tailscale IP)
+  VKOPS_SSH_USER  ssh user
+  VKOPS_SSH_PASS  ssh password
 
 Usage:  python deploy.py [remote_dir]      # default remote dir: C:/vkops
 """
@@ -15,14 +15,14 @@ import paramiko
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-HOST = os.environ.get("VKOPS_SSH_HOST", "100.105.188.76")
-USER = os.environ.get("VKOPS_SSH_USER", "administrator")
+HOST = os.environ.get("VKOPS_SSH_HOST", "")
+USER = os.environ.get("VKOPS_SSH_USER", "")
 PWD = os.environ.get("VKOPS_SSH_PASS", "")
 REMOTE = (sys.argv[1] if len(sys.argv) > 1 else "C:/vkops").rstrip("/")
 
 LOCAL = os.path.dirname(os.path.abspath(__file__))
 SKIP_DIRS = {".git", "ref", "__pycache__"}
-SKIP_EXT = {".safetensors", ".spv"}
+SKIP_EXT = {".safetensors", ".spv", ".json"}
 
 
 def ensure_dir(sftp, rdir):
@@ -41,8 +41,10 @@ def ensure_dir(sftp, rdir):
 
 
 def main():
-    if not PWD:
-        print("error: set VKOPS_SSH_PASS first")
+    missing = [k for k, v in (("VKOPS_SSH_HOST", HOST), ("VKOPS_SSH_USER", USER),
+                              ("VKOPS_SSH_PASS", PWD)) if not v]
+    if missing:
+        print("error: set environment variable(s): " + ", ".join(missing))
         return 1
     c = paramiko.SSHClient()
     c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
