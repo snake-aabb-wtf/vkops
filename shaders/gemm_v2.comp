@@ -1,0 +1,112 @@
+#version 450
+// gemm_v2: register-blocked GEMM.
+//   Workgroup 16x16 threads -> 64x64 output tile, k-slice 16.
+//   Each thread computes a 4x4 sub-block (16 accumulators).
+//   LDS traffic per FMA: 0.5 loads (v1 was 2.0) -> ~4x less shared-memory pressure.
+//   B global load mapping chosen by layout so reads stay coalesced:
+//     bT=1 ([N,K], torch weights): b[gc*K+gr], gr contiguous across threads.
+//     bT=0 ([K,N]):                b[gr*N+gc], gc contiguous across threads.
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer BufA { float a[]; };
+layout(std430, set = 0, binding = 1) readonly buffer BufB { float b[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer BufD { float d[]; };
+
+layout(push_constant) uniform Push {
+    uvec4 dims;   // x=M, y=N, z=K
+    vec4  flags;  // y = bT
+} pc;
+
+shared float As[16][64];
+shared float Bs[16][64];
+
+void main() {
+    uint M = pc.dims.x;
+    uint N = pc.dims.y;
+    uint K = pc.dims.z;
+    uint bT = pc.flags.y != 0.0 ? 1u : 0u;
+
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+    uint th = ty * 16u + tx;
+
+    uint row0 = gl_WorkGroupID.y * 64u + ty * 4u;
+    uint col0 = gl_WorkGroupID.x * 64u + tx * 4u;
+
+    float acc[4][4];
+    for (uint i = 0u; i < 4u; ++i)
+        for (uint j = 0u; j < 4u; ++j)
+            acc[i][j] = 0.0;
+
+    for (uint t = 0u; t < K; t += 16u) {
+        // cooperative tile load: 1024 elements / 256 threads = 4 each
+        if (bT != 0u) {
+            // A: row-major chunks are contiguous -> idx = (mm<<4)|kk
+            for (uint j = 0u; j < 4u; ++j) {
+                uint idx = th * 4u + j;
+                uint mm = idx >> 4u;
+                uint kk = idx & 15u;
+                uint gr = gl_WorkGroupID.y * 64u + mm;
+                uint gc = t + kk;
+                As[kk][mm] = (gr < M && gc < K) ? a[gr * K + gc] : 0.0;
+            }
+            // B([N,K]): b[gc*K+gr], gr contiguous -> idx = (nn<<4)|kk
+            for (uint j = 0u; j < 4u; ++j) {
+                uint idx = th * 4u + j;
+                uint nn = idx >> 4u;
+                uint kk = idx & 15u;
+                uint gr = t + kk;
+                uint gc = gl_WorkGroupID.x * 64u + nn;
+                Bs[kk][nn] = (gr < K && gc < N) ? b[gc * K + gr] : 0.0;
+            }
+        } else {
+            for (uint j = 0u; j < 4u; ++j) {
+                uint idx = th * 4u + j;
+                uint mm = idx >> 4u;
+                uint kk = idx & 15u;
+                uint gr = gl_WorkGroupID.y * 64u + mm;
+                uint gc = t + kk;
+                As[kk][mm] = (gr < M && gc < K) ? a[gr * K + gc] : 0.0;
+            }
+            // B([K,N]): b[gr*N+gc], gc contiguous -> idx = (kk<<6)|nn
+            for (uint j = 0u; j < 4u; ++j) {
+                uint idx = th * 4u + j;
+                uint kk = idx >> 6u;
+                uint nn = idx & 63u;
+                uint gr = t + kk;
+                uint gc = gl_WorkGroupID.x * 64u + nn;
+                Bs[kk][nn] = (gr < K && gc < N) ? b[gr * N + gc] : 0.0;
+            }
+        }
+        barrier();
+        for (uint kk = 0u; kk < 16u; ++kk) {
+            float av0 = As[kk][ty * 4u + 0u];
+            float av1 = As[kk][ty * 4u + 1u];
+            float av2 = As[kk][ty * 4u + 2u];
+            float av3 = As[kk][ty * 4u + 3u];
+            float bv0 = Bs[kk][tx * 4u + 0u];
+            float bv1 = Bs[kk][tx * 4u + 1u];
+            float bv2 = Bs[kk][tx * 4u + 2u];
+            float bv3 = Bs[kk][tx * 4u + 3u];
+            acc[0][0] += av0 * bv0; acc[0][1] += av0 * bv1;
+            acc[0][2] += av0 * bv2; acc[0][3] += av0 * bv3;
+            acc[1][0] += av1 * bv0; acc[1][1] += av1 * bv1;
+            acc[1][2] += av1 * bv2; acc[1][3] += av1 * bv3;
+            acc[2][0] += av2 * bv0; acc[2][1] += av2 * bv1;
+            acc[2][2] += av2 * bv2; acc[2][3] += av2 * bv3;
+            acc[3][0] += av3 * bv0; acc[3][1] += av3 * bv1;
+            acc[3][2] += av3 * bv2; acc[3][3] += av3 * bv3;
+        }
+        barrier();
+    }
+
+    for (uint i = 0u; i < 4u; ++i) {
+        for (uint j = 0u; j < 4u; ++j) {
+            uint r = row0 + i;
+            uint c = col0 + j;
+            if (r < M && c < N) {
+                d[r * N + c] = acc[i][j];
+            }
+        }
+    }
+}

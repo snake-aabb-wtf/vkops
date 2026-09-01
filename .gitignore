@@ -1,0 +1,8 @@
+# runtime artifacts
+__pycache__/
+*.pyc
+*.spv
+*.safetensors
+
+# vendored reference (re-pull from any Vulkan SDK 1.4.x: Include/vulkan/vulkan_core.h)
+ref/

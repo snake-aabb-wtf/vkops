@@ -1,0 +1,20 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// cvt_f32_f16: elementwise float32 -> float16 conversion (for activation buffers).
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Src { float s[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Dst { float16_t o[]; };
+
+layout(push_constant) uniform Push {
+    uvec4 dims;   // x = element count
+    vec4  flags;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.dims.x) return;
+    o[i] = float16_t(s[i]);
+}

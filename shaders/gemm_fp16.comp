@@ -1,0 +1,160 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// gemm_fp16: packed-FP16 register-blocked GEMM, LDS-access-optimized.
+//   64x64 tile, 4x4 outputs per thread, k-slice 32 processed in 4-k blocks.
+//   LDS layout (f16vec4 blocks over k): A4[8][64], B4[8][64]  (bT)
+//                                       A4[8][64], B2[32][32] (non-bT)
+//   Per 4-k block each thread does 8 LDS reads (was 32 scalar reads) and
+//   32 packed FMAs (V_PK_FMA_F16).
+//   Accumulation: f16 within the 32-k slice, f32 across slices.
+//   Requires: K % 32 == 0; additionally N % 4 == 0 when bT == 0.
+//   A: [M, K] f16.  B: bT ? [N, K] f16 (torch) : [K, N] f16.  D: [M, N] f32.
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer BufA { f16vec4 a[]; };
+layout(std430, set = 0, binding = 1) readonly buffer BufB { f16vec4 b[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer BufD { float d[]; };
+
+layout(push_constant) uniform Push {
+    uvec4 dims;   // x=M, y=N, z=K
+    vec4  flags;  // y = bT
+} pc;
+
+shared f16vec4 A4[8][64];   // A4[j][row] = k in [4j, 4j+3]
+shared f16vec4 B4[8][64];   // bT: B4[j][col] = k in [4j, 4j+3]
+shared f16vec2 B2[32][32];  // non-bT: B2[k][n/2] = cols (n, n+1)
+
+void main() {
+    uint M  = pc.dims.x;
+    uint N  = pc.dims.y;
+    uint K  = pc.dims.z;
+    uint K4 = K >> 2u;
+    uint N4 = N >> 2u;
+    uint bT = pc.flags.y != 0.0 ? 1u : 0u;
+
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+    uint th = ty * 16u + tx;
+    uint gx = gl_WorkGroupID.x;
+    uint gy = gl_WorkGroupID.y;
+
+    uint row0 = gy * 64u + ty * 4u;
+    uint col0 = gx * 64u + tx * 4u;
+
+    vec2 accf00 = vec2(0.0), accf01 = vec2(0.0);
+    vec2 accf10 = vec2(0.0), accf11 = vec2(0.0);
+    vec2 accf20 = vec2(0.0), accf21 = vec2(0.0);
+    vec2 accf30 = vec2(0.0), accf31 = vec2(0.0);
+
+    for (uint t = 0u; t < K; t += 32u) {
+        // ---- cooperative tile load: 256 threads * 8 f16 = 2048 elements ----
+        uint j4  = (th & 3u) * 2u;              // f16vec4 k-block base: 0,2,4,6
+        uint k4c = (t >> 2u) + j4;              // global f16vec4 k-index
+        {
+            uint mm = th >> 2u;                 // 0..63
+            uint gr = gy * 64u + mm;
+            A4[j4][mm]     = (gr < M) ? a[gr * K4 + k4c]     : f16vec4(0.0);
+            A4[j4 + 1u][mm] = (gr < M) ? a[gr * K4 + k4c + 1u] : f16vec4(0.0);
+        }
+        if (bT != 0u) {
+            // B is [N, K] -> f16vec4 [N, K/4]
+            uint nn = th >> 2u;
+            uint gc = gx * 64u + nn;
+            B4[j4][nn]     = (gc < N) ? b[gc * K4 + k4c]     : f16vec4(0.0);
+            B4[j4 + 1u][nn] = (gc < N) ? b[gc * K4 + k4c + 1u] : f16vec4(0.0);
+        } else {
+            // B is [K, N] -> f16vec4 [K, N/4]: row kk, 8 consecutive n
+            uint kk  = th >> 3u;                // 0..31
+            uint nq  = (th & 7u) * 8u;          // scalar n base: 0,8,...,56
+            uint gr  = t + kk;
+            uint gc0 = gx * 64u + nq;
+            uint n4c = (gx * 64u >> 2u) + (th & 7u) * 2u;
+            f16vec4 v0 = (gr < K && gc0 < N)     ? b[gr * N4 + n4c]     : f16vec4(0.0);
+            f16vec4 v1 = (gr < K && gc0 + 4u < N) ? b[gr * N4 + n4c + 1u] : f16vec4(0.0);
+            B2[kk][nq >> 1u]        = v0.xy;
+            B2[kk][(nq >> 1u) + 1u] = v0.zw;
+            B2[kk][(nq >> 1u) + 2u] = v1.xy;
+            B2[kk][(nq >> 1u) + 3u] = v1.zw;
+        }
+        barrier();
+
+        // ---- 8 x (4-k block): 8 LDS reads + 32 packed FMAs per block ----
+        f16vec2 s00 = f16vec2(0.0), s01 = f16vec2(0.0);
+        f16vec2 s10 = f16vec2(0.0), s11 = f16vec2(0.0);
+        f16vec2 s20 = f16vec2(0.0), s21 = f16vec2(0.0);
+        f16vec2 s30 = f16vec2(0.0), s31 = f16vec2(0.0);
+        uint rb = ty * 4u;
+        uint cb = tx * 4u;
+        for (uint j = 0u; j < 8u; ++j) {
+            f16vec4 a0 = A4[j][rb];
+            f16vec4 a1 = A4[j][rb + 1u];
+            f16vec4 a2 = A4[j][rb + 2u];
+            f16vec4 a3 = A4[j][rb + 3u];
+            if (bT != 0u) {
+                f16vec4 c0 = B4[j][cb];
+                f16vec4 c1 = B4[j][cb + 1u];
+                f16vec4 c2 = B4[j][cb + 2u];
+                f16vec4 c3 = B4[j][cb + 3u];
+                for (uint q = 0u; q < 4u; ++q) {
+                    f16vec2 w01 = f16vec2(c0[q], c1[q]);
+                    f16vec2 w23 = f16vec2(c2[q], c3[q]);
+                    f16vec2 av0 = f16vec2(a0[q]);
+                    f16vec2 av1 = f16vec2(a1[q]);
+                    f16vec2 av2 = f16vec2(a2[q]);
+                    f16vec2 av3 = f16vec2(a3[q]);
+                    s00 = fma(av0, w01, s00); s01 = fma(av0, w23, s01);
+                    s10 = fma(av1, w01, s10); s11 = fma(av1, w23, s11);
+                    s20 = fma(av2, w01, s20); s21 = fma(av2, w23, s21);
+                    s30 = fma(av3, w01, s30); s31 = fma(av3, w23, s31);
+                }
+            } else {
+                uint kb = j * 4u;
+                for (uint q = 0u; q < 4u; ++q) {
+                    f16vec2 w01 = B2[kb + q][cb >> 1u];
+                    f16vec2 w23 = B2[kb + q][(cb >> 1u) + 1u];
+                    f16vec2 av0 = f16vec2(a0[q]);
+                    f16vec2 av1 = f16vec2(a1[q]);
+                    f16vec2 av2 = f16vec2(a2[q]);
+                    f16vec2 av3 = f16vec2(a3[q]);
+                    s00 = fma(av0, w01, s00); s01 = fma(av0, w23, s01);
+                    s10 = fma(av1, w01, s10); s11 = fma(av1, w23, s11);
+                    s20 = fma(av2, w01, s20); s21 = fma(av2, w23, s21);
+                    s30 = fma(av3, w01, s30); s31 = fma(av3, w23, s31);
+                }
+            }
+        }
+        accf00 += vec2(s00); accf01 += vec2(s01);
+        accf10 += vec2(s10); accf11 += vec2(s11);
+        accf20 += vec2(s20); accf21 += vec2(s21);
+        accf30 += vec2(s30); accf31 += vec2(s31);
+        barrier();
+    }
+
+    // ---- store (f32) ----
+    if (row0 < M) {
+        if (col0 < N)      d[row0 * N + col0]      = accf00.x;
+        if (col0 + 1u < N) d[row0 * N + col0 + 1u] = accf00.y;
+        if (col0 + 2u < N) d[row0 * N + col0 + 2u] = accf01.x;
+        if (col0 + 3u < N) d[row0 * N + col0 + 3u] = accf01.y;
+    }
+    if (row0 + 1u < M) {
+        if (col0 < N)      d[(row0 + 1u) * N + col0]      = accf10.x;
+        if (col0 + 1u < N) d[(row0 + 1u) * N + col0 + 1u] = accf10.y;
+        if (col0 + 2u < N) d[(row0 + 1u) * N + col0 + 2u] = accf11.x;
+        if (col0 + 3u < N) d[(row0 + 1u) * N + col0 + 3u] = accf11.y;
+    }
+    if (row0 + 2u < M) {
+        if (col0 < N)      d[(row0 + 2u) * N + col0]      = accf20.x;
+        if (col0 + 1u < N) d[(row0 + 2u) * N + col0 + 1u] = accf20.y;
+        if (col0 + 2u < N) d[(row0 + 2u) * N + col0 + 2u] = accf21.x;
+        if (col0 + 3u < N) d[(row0 + 2u) * N + col0 + 3u] = accf21.y;
+    }
+    if (row0 + 3u < M) {
+        if (col0 < N)      d[(row0 + 3u) * N + col0]      = accf30.x;
+        if (col0 + 1u < N) d[(row0 + 3u) * N + col0 + 1u] = accf30.y;
+        if (col0 + 2u < N) d[(row0 + 3u) * N + col0 + 2u] = accf31.x;
+        if (col0 + 3u < N) d[(row0 + 3u) * N + col0 + 3u] = accf31.y;
+    }
+}

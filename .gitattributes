@@ -1,0 +1,5 @@
+# normalize line endings: LF in repo, native in working tree
+* text=auto
+*.comp text
+*.py text
+*.md text
