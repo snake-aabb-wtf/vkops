@@ -74,7 +74,9 @@ a small subset of tensors, so a subset file works too.
 你> 你好！请用两三句话介绍一下你自己。
 你好！我是通义千问（Qwen），是阿里巴巴集团旗下的通义实验室自主研发的
 超大规模语言模型，能够回答问题、创作文字、进行逻辑推理和编程等。...
-[gen] 65 tokens in 41.8s -> 1.6 tok/s
+[gen] 65 tokens in 41.8s -> 1.6 tok/s  (per-op submits)
+[gen] 53 tokens in 28.3s -> 1.9 tok/s  (batched: ~37 submits/token, fused
+      rmsnorm_f16/silu_mul_f16 shaders, CPU-side f16 attention upload)
 ```
 
 Self-test on real weights: GPU vs numpy reference top-10 logits **10/10

@@ -1,0 +1,43 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// rmsnorm_f16: RMSNorm with direct FP16 output (saves a separate cvt dispatch).
+// Y[r,:] = float16_t( X[r,:] / sqrt(mean(X[r,:]^2) + eps) * W )
+// One workgroup per row.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer BufX { float x[]; };
+layout(std430, set = 0, binding = 1) readonly buffer BufW { float w[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer BufY { float16_t y[]; };
+
+layout(push_constant) uniform Push {
+    uvec4 dims;   // x = rows, y = row width n
+    vec4  flags;  // x = eps
+} pc;
+
+shared float red[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint n   = pc.dims.y;
+
+    float s = 0.0;
+    for (uint j = tid; j < n; j += 256u) {
+        float v = x[row * n + j];
+        s += v * v;
+    }
+    red[tid] = s;
+    barrier();
+
+    for (uint st = 128u; st >= 1u; st >>= 1u) {
+        if (tid < st) red[tid] += red[tid + st];
+        barrier();
+    }
+
+    float inv = inversesqrt(red[0] / float(n) + pc.flags.x);
+    for (uint j = tid; j < n; j += 256u) {
+        y[row * n + j] = float16_t(x[row * n + j] * inv * w[j]);
+    }
+}

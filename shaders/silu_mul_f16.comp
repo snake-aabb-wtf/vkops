@@ -1,0 +1,23 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// silu_mul_f16: D[i] = float16_t( silu(A[i]) * B[i] )  (direct FP16 output,
+// replaces the silu_mul + cvt pair in the batched decode path).
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer BufA { float a[]; };
+layout(std430, set = 0, binding = 1) readonly buffer BufB { float b[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer BufD { float16_t d[]; };
+
+layout(push_constant) uniform Push {
+    uvec4 dims;   // x = element count
+    vec4  flags;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.dims.x) return;
+    float x = a[i];
+    d[i] = float16_t((x / (1.0 + exp(-x))) * b[i]);
+}

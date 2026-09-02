@@ -137,6 +137,69 @@ def main():
         print("SELFTEST", "PASSED" if ok else "FAILED", flush=True)
         return 0 if ok else 1
 
+    if mode == "cmp_paths":
+        ids2 = tok.encode("你好，请介绍一下你自己。").ids[:6]
+        old_logits, old_states = eng.forward_perop(ids2, 0, collect_states=True)
+        eng.clear_cache()
+        new_logits = eng.forward(ids2, 0)
+        eng.clear_cache()
+        eng.forward(ids2, 0, collect_states=True)
+        new_states = eng.layer_states
+        d_log = np.max(np.abs(old_logits - new_logits)) / (np.max(np.abs(old_logits)) + 1e-9)
+        print(f"logits old-vs-new: rel_err={d_log:.3e}", flush=True)
+        for li, (a, b) in enumerate(zip(old_states, new_states)):
+            e = np.max(np.abs(a - b)) / (np.max(np.abs(a)) + 1e-9)
+            if e > 1e-4 or li < 3:
+                print(f"state {li}: old-vs-new rel_err={e:.3e}", flush=True)
+        return 0
+
+    if mode == "diverge":
+        ids2 = tok.encode("你好，请介绍一下你自己。").ids[:6]
+        eng.forward(ids2, pos_start=0, collect_states=True)
+        states = eng.layer_states
+        headers = chat.scan_headers(MODEL_DIR)
+
+        def wt(nm):
+            return chat.read_tensor(MODEL_DIR, nm, headers) \
+                .astype(np.float16).astype(np.float32)
+
+        def wf(nm):
+            return chat.read_tensor(MODEL_DIR, nm, headers)
+
+        h = chat.read_tensor(MODEL_DIR, "model.embed_tokens.weight", headers)[ids2] \
+            .astype(np.float16).astype(np.float32)
+        states_np = [h.copy()]
+        pos = np.arange(len(ids2))
+        for li in range(NUM_LAYERS):
+            p = f"model.layers.{li}."
+            x = chat.rmsnorm_np(h, wf(p + "input_layernorm.weight"))
+            qq = chat.rope(chat.head_rmsnorm(x @ wt(p + "self_attn.q_proj.weight").T,
+                                             wf(p + "self_attn.q_norm.weight")), pos, chat.HEADS)
+            kk = chat.rope(chat.head_rmsnorm(x @ wt(p + "self_attn.k_proj.weight").T,
+                                             wf(p + "self_attn.k_norm.weight")), pos, chat.KV_HEADS)
+            vv = x @ wt(p + "self_attn.v_proj.weight").T
+            att = chat.attention_np(qq, kk, vv, len(ids2), len(ids2), True)
+            h = h + att @ wt(p + "self_attn.o_proj.weight").T
+            states_np.append(h.copy())
+            x2 = chat.rmsnorm_np(h, wf(p + "post_attention_layernorm.weight"))
+            g = x2 @ wt(p + "mlp.gate_proj.weight").T
+            u = x2 @ wt(p + "mlp.up_proj.weight").T
+            a = (g / (1 + np.exp(-g))) * u
+            h = h + a @ wt(p + "mlp.down_proj.weight").T
+            states_np.append(h.copy())
+        first = None
+        for li, (g, r) in enumerate(zip(states, states_np)):
+            e = np.max(np.abs(g - r)) / (np.max(np.abs(r)) + 1e-9)
+            tag = ""
+            if e > 0.05 and first is None:
+                first = li
+                tag = "   <<< FIRST DIVERGENCE"
+                print("   gpu:", g[0][:8], flush=True)
+                print("   ref:", r[0][:8], flush=True)
+            print(f"state {li}: rel_err={e:.3e}{tag}", flush=True)
+        print("first divergence at state", first, flush=True)
+        return 0
+
     if mode:
         chat_once(gpu, eng, tok, " ".join(sys.argv[1:]))
         return 0

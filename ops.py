@@ -27,6 +27,8 @@ SHADER_FILES = {
     "gemm_v2": "gemm_v2.comp",
     "gemm_fp16": "gemm_fp16.comp",
     "cvt_f32_f16": "cvt_f32_f16.comp",
+    "rmsnorm_f16": "rmsnorm_f16.comp",
+    "silu_mul_f16": "silu_mul_f16.comp",
     "silu_mul": "silu_mul.comp",
     "add": "add.comp",
     "rmsnorm": "rmsnorm.comp",
@@ -80,7 +82,7 @@ class GPU:
         return buf.np(np.float32, count=int(np.prod(shape))).reshape(shape).copy()
 
     # -- pipelines ----------------------------------------------------------
-    FP16_PIPELINES = ("gemm_fp16", "cvt_f32_f16")
+    FP16_PIPELINES = ("gemm_fp16", "cvt_f32_f16", "rmsnorm_f16", "silu_mul_f16")
 
     def _pipeline(self, name, nbind):
         if name in self.FP16_PIPELINES and not self.dev.fp16_enabled:
@@ -106,6 +108,44 @@ class GPU:
             "push": push, "gx": _ceil_div(N, 16), "gy": _ceil_div(M, 16), "gz": 1,
         }])
         return out
+
+    # -- job builders (no submit; compose lists for batched submits) ---------
+    def job_gemm_fp16(self, A, B, M, N, K, bT=False, out=None):
+        if out is None:
+            out = self.dev.alloc(M * N * 4)
+        return {"pipeline": self._pipeline("gemm_fp16", 3),
+                "buffers": [A, B, out],
+                "push": _push(M, N, K, 0, 0.0, 1.0 if bT else 0.0),
+                "gx": _ceil_div(N, 64), "gy": _ceil_div(M, 64), "gz": 1}, out
+
+    def job_rmsnorm_f16(self, x, w, rows, n, eps=1e-6, out=None):
+        if out is None:
+            out = self.dev.alloc(rows * n * 2)
+        return {"pipeline": self._pipeline("rmsnorm_f16", 3),
+                "buffers": [x, w, out],
+                "push": _push(rows, n, f0=float(eps)), "gx": rows}, out
+
+    def job_silu_mul(self, a, b, n, out=None):
+        if out is None:
+            out = self.dev.alloc(n * 4)
+        return {"pipeline": self._pipeline("silu_mul", 3),
+                "buffers": [a, b, out], "push": _push(n),
+                "gx": _ceil_div(n, 256)}, out
+
+    def job_silu_mul_f16(self, a, b, n, out=None):
+        """SwiGLU activation with direct FP16 output (for batched decode paths)."""
+        if out is None:
+            out = self.dev.alloc(n * 2)
+        return {"pipeline": self._pipeline("silu_mul_f16", 3),
+                "buffers": [a, b, out], "push": _push(n),
+                "gx": _ceil_div(n, 256)}, out
+
+    def job_add(self, a, b, n, out=None):
+        if out is None:
+            out = self.dev.alloc(n * 4)
+        return {"pipeline": self._pipeline("add", 3),
+                "buffers": [a, b, out], "push": _push(n),
+                "gx": _ceil_div(n, 256)}, out
 
     def linear(self, x, W, bias=None, act=ACT_NONE, x_rows=None, w_layout="auto", out=None):
         """nn.Linear style: D = act(x @ W^T + bias)  (x: M rows of width x_rows).

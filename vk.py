@@ -545,18 +545,20 @@ class VulkanDevice:
         _check(F["vkAllocateCommandBuffers"][0](self.device, ctypes.byref(cai), ctypes.byref(self.cmd)), "vkAllocateCommandBuffers")
 
     def _choose_type(self, required, prefer):
-        """Pick memory type index containing `required` bits, maximizing preferred bits (in order)."""
-        best_idx, best_score = None, -1
+        """Pick memory type index containing `required` bits.
+
+        Primary criterion: the LARGEST backing heap (a tiny DEVICE_LOCAL
+        carveout must never host the model; WDDM may silently overcommit it
+        and later evict pages under pressure). Tie-break on `prefer` bits."""
+        best_idx, best_key = None, None
         for i in range(self.memprops.memoryTypeCount):
             t = self.memprops.memoryTypes[i]
             if (t.propertyFlags & required) != required:
                 continue
-            score = 0
-            for bit in prefer:
-                if t.propertyFlags & bit:
-                    score += 1
-            if score > best_score:
-                best_idx, best_score = i, score
+            heap_size = self.memprops.memoryHeaps[t.heapIndex].size
+            score = (heap_size, sum(1 for bit in prefer if t.propertyFlags & bit))
+            if best_key is None or score > best_key:
+                best_idx, best_key = i, score
         if best_idx is None:
             raise VulkanError(f"no memory type with required bits {required:#x}")
         return best_idx
