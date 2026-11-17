@@ -27,6 +27,9 @@ SHADER_FILES = {
     "gemm_v2": "gemm_v2.comp",
     "gemm_fp16": "gemm_fp16.comp",
     "gemv_fp16": "gemv_fp16.comp",
+    "gemm_small2_fp16": "gemm_small_fp16.comp",
+    "gemm_small4_fp16": "gemm_small_fp16.comp",
+    "gemm_small8_fp16": "gemm_small_fp16.comp",
     "cvt_f32_f16": "cvt_f32_f16.comp",
     "rmsnorm_f16": "rmsnorm_f16.comp",
     "silu_mul_f16": "silu_mul_f16.comp",
@@ -38,7 +41,10 @@ SHADER_FILES = {
 
 def _load_shader(name):
     with open(os.path.join(SHADER_DIR, SHADER_FILES[name]), "r", encoding="utf-8") as f:
-        return f.read()
+        source = f.read()
+    if name.startswith("gemm_small"):
+        source = source.replace("#define BATCH 8", "#define BATCH " + name[10])
+    return source
 
 
 def _ceil_div(a, b):
@@ -83,7 +89,8 @@ class GPU:
         return buf.np(np.float32, count=int(np.prod(shape))).reshape(shape).copy()
 
     # -- pipelines ----------------------------------------------------------
-    FP16_PIPELINES = ("gemm_fp16", "gemv_fp16", "cvt_f32_f16", "rmsnorm_f16", "silu_mul_f16")
+    FP16_PIPELINES = ("gemm_fp16", "gemv_fp16", "gemm_small2_fp16", "gemm_small4_fp16",
+                      "gemm_small8_fp16", "cvt_f32_f16", "rmsnorm_f16", "silu_mul_f16")
 
     def _pipeline(self, name, nbind):
         if name in self.FP16_PIPELINES and not self.dev.fp16_enabled:
@@ -120,6 +127,11 @@ class GPU:
             out = self.dev.alloc(M * N * 4)
         if M == 1 and bT and N <= 8 * 65535 and os.environ.get("VKOPS_DISABLE_GEMV") != "1":
             return {"pipeline": self._pipeline("gemv_fp16", 3),
+                    "buffers": [A, B, out], "push": _push(M, N, K),
+                    "gx": _ceil_div(N, 8)}, out
+        if 2 <= M <= 8 and bT and N <= 8 * 65535 and os.environ.get("VKOPS_DISABLE_SMALL_GEMM") != "1":
+            batch = 2 if M <= 2 else 4 if M <= 4 else 8
+            return {"pipeline": self._pipeline(f"gemm_small{batch}_fp16", 3),
                     "buffers": [A, B, out], "push": _push(M, N, K),
                     "gx": _ceil_div(N, 8)}, out
         return {"pipeline": self._pipeline("gemm_fp16", 3),

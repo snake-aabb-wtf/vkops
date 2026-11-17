@@ -1,0 +1,47 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// A[M,K] * B[N,K]^T -> D[M,N], 2 <= M <= BATCH.
+// Same FP32 FMA/reduction order as GEMV; reuse each weight across input rows.
+#define BATCH 8
+#define LANES 32u
+#define ROWS (256u / LANES)
+layout(local_size_x = 256) in;
+layout(std430, set = 0, binding = 0) readonly buffer BufA { f16vec4 a[]; };
+layout(std430, set = 0, binding = 1) readonly buffer BufB { f16vec4 b[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer BufD { float d[]; };
+layout(push_constant) uniform Push { uvec4 dims; vec4 flags; } pc;
+shared float sums[BATCH][256];
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint lane = tid % LANES;
+    uint row = gl_WorkGroupID.x * ROWS + tid / LANES;
+    uint k4 = pc.dims.z >> 2u;
+    vec4 acc[BATCH];
+    for (uint m = 0u; m < BATCH; ++m) acc[m] = vec4(0.0);
+    if (row < pc.dims.y) {
+        for (uint k = lane; k < k4; k += LANES) {
+            vec4 weight = vec4(b[row * k4 + k]);
+            for (uint m = 0u; m < BATCH; ++m) {
+                if (m < pc.dims.x)
+                    acc[m] = fma(vec4(a[m * k4 + k]), weight, acc[m]);
+            }
+        }
+    }
+    for (uint m = 0u; m < BATCH; ++m)
+        sums[m][tid] = (acc[m].x + acc[m].y) + (acc[m].z + acc[m].w);
+    barrier();
+    for (uint stride = LANES / 2u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            for (uint m = 0u; m < BATCH; ++m)
+                sums[m][tid] += sums[m][tid + stride];
+        }
+        barrier();
+    }
+    if (lane == 0u && row < pc.dims.y) {
+        for (uint m = 0u; m < BATCH; ++m) {
+            if (m < pc.dims.x) d[m * pc.dims.y + row] = sums[m][tid];
+        }
+    }
+}

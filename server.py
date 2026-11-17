@@ -102,6 +102,11 @@ class Handler(BaseHTTPRequestHandler):
         temperature = float(body.get("temperature", 0.7))
         top_p = float(body.get("top_p", 0.8))
         max_tokens = int(body.get("max_tokens", 256))
+        speculative_ngram = body.get("speculative_ngram", False)
+        if not isinstance(speculative_ngram, bool) or (speculative_ngram and temperature != 0):
+            self._send_json(400, {"error": {
+                "message": "speculative_ngram must be a boolean and requires temperature=0"}})
+            return
 
         prompt_ids = build_prompt_ids(messages)
         budget = MAX_CTX - len(prompt_ids) - 4
@@ -117,16 +122,18 @@ class Handler(BaseHTTPRequestHandler):
         with GPU_LOCK:  # one engine, serialize generation
             if stream:
                 self._stream_response(cid, created, prompt_ids,
-                                      temperature, top_p, max_tokens)
+                                      temperature, top_p, max_tokens, speculative_ngram)
             else:
                 self._complete_response(cid, created, prompt_ids,
-                                        temperature, top_p, max_tokens)
+                                        temperature, top_p, max_tokens, speculative_ngram)
 
-    def _complete_response(self, cid, created, prompt_ids, temperature, top_p, max_tokens):
+    def _complete_response(self, cid, created, prompt_ids, temperature, top_p, max_tokens,
+                           speculative_ngram=False):
         t0 = time.perf_counter()
         rng = np.random.default_rng()
         gen = eng.generate(prompt_ids, max_new=max_tokens, temperature=temperature,
-                           top_p=top_p, rng=rng, eos=chat.IM_END)
+                           top_p=top_p, rng=rng, eos=chat.IM_END,
+                           speculative_ngram=speculative_ngram)
         text = tok.decode(gen)
         dt = time.perf_counter() - t0
         print(f"[chat] prompt={len(prompt_ids)} completion={len(gen)} "
@@ -141,7 +148,8 @@ class Handler(BaseHTTPRequestHandler):
                       "completion_tokens": len(gen),
                       "total_tokens": len(prompt_ids) + len(gen)}})
 
-    def _stream_response(self, cid, created, prompt_ids, temperature, top_p, max_tokens):
+    def _stream_response(self, cid, created, prompt_ids, temperature, top_p, max_tokens,
+                         speculative_ngram=False):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -163,7 +171,8 @@ class Handler(BaseHTTPRequestHandler):
         t0 = time.perf_counter()
         gen = eng.generate(prompt_ids, max_new=max_tokens, temperature=temperature,
                            top_p=top_p, rng=rng, eos=chat.IM_END,
-                           callback=lambda t: chunk({"content": tok.decode([t])}))
+                           callback=lambda t: chunk({"content": tok.decode([t])}),
+                           speculative_ngram=speculative_ngram)
         dt = time.perf_counter() - t0
         finish = "stop" if len(gen) < max_tokens else "length"
         chunk({})

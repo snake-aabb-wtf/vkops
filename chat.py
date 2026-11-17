@@ -143,7 +143,9 @@ class Qwen3Engine:
         self.V = VOCAB
         self.max_ctx = max_ctx
         self._embed_view = None
-        self.max_ctx = max_ctx
+        self.cache_length = 0
+        self._feature_layers = ()
+        self.last_features = None
         self.embed16 = bufs["model.embed_tokens.weight"]
         self.final_norm = bufs["model.norm.weight"]
         self._layers = []
@@ -197,16 +199,53 @@ class Qwen3Engine:
         for kc, vc in zip(self.kc, self.vc):
             kc[:] = 0
             vc[:] = 0
+        self.cache_length = 0
 
-    def forward_perop(self, ids, pos_start=0, collect_states=False):
+    def truncate_cache(self, length):
+        """Discard a speculative suffix. Stale rows are never read beyond length."""
+        if not isinstance(length, (int, np.integer)) or not 0 <= length <= self.cache_length:
+            raise ValueError("cache length must be an integer within the valid prefix")
+        self.cache_length = int(length)
+
+    def enable_feature_capture(self, layers):
+        """Opt in to full decoder-layer outputs for an external draft model.
+
+        Features are concatenated in the requested order, for the most recent
+        forward only. Disabled by default; callers retain only accepted rows.
+        """
+        layers = tuple(layers)
+        if (len(set(layers)) != len(layers) or any(
+                not isinstance(li, (int, np.integer)) or not 0 <= li < self.num_layers
+                for li in layers)):
+            raise ValueError("feature layers must be unique valid decoder-layer indices")
+        self._feature_layers = layers
+        self.last_features = None
+
+    def _prepare_forward(self, ids, pos_start):
+        tokens = np.asarray(ids)
+        if (tokens.ndim != 1 or not len(tokens) or tokens.dtype.kind not in 'iu'
+                or np.any(tokens < 0) or np.any(tokens >= self.V)):
+            raise ValueError("ids must be a nonempty sequence of valid integer token IDs")
+        if (not isinstance(pos_start, (int, np.integer))
+                or not 0 <= pos_start <= self.cache_length
+                or pos_start + len(tokens) > self.max_ctx):
+            raise ValueError("forward must extend/overwrite a valid cache prefix within max_ctx")
+        # If a GPU operation fails, only the untouched prefix remains valid.
+        self.cache_length = int(pos_start)
+        self.last_features = None
+        return tokens
+
+    def forward_perop(self, ids, pos_start=0, collect_states=False, all_logits=False):
         """Reference path: one submit per op (the original implementation).
         Used to A/B against the batched forward on the same device."""
+        ids = self._prepare_forward(ids, pos_start)
         gpu, s = self.gpu, self.s
         M, H = len(ids), self.H
         T = pos_start + M
         h = s["ra"]
         h.upload(self._embed_f16()[np.asarray(ids)].astype(np.float32))
-        causal = (pos_start == 0 and M > 1)
+        causal = M > 1
+        features = {}
         states = None
         if collect_states:
             states = [h.np(np.float32, count=M * H).reshape(M, H).copy()]
@@ -240,27 +279,35 @@ class Qwen3Engine:
             h = gpu.add(h, dn, M * H, out=s["ra"])
             if collect_states:
                 states.append(h.np(np.float32, count=M * H).reshape(M, H).copy())
+            if li in self._feature_layers:
+                features[li] = h.np(np.float32, count=M * H).reshape(M, H).copy()
         x = gpu.rmsnorm(h, self.final_norm, M, H, out=s["xn"])
         gpu.to_f16(x, M * H, dst=s["x216"])
         logits = gpu.gemm_fp16(s["x216"], self.embed16, M, VOCAB, H,
                                bT=True, out=self.logits_buf)
-        if collect_states:
-            return logits.np(np.float32, count=M * VOCAB) \
-                .reshape(M, VOCAB)[M - 1].copy(), states
-        return logits.np(np.float32, count=M * VOCAB).reshape(M, VOCAB)[M - 1].copy()
+        self.cache_length = T
+        if self._feature_layers:
+            self.last_features = np.concatenate([features[li] for li in self._feature_layers], axis=-1)
+        rows = logits.np(np.float32, count=M * VOCAB).reshape(M, VOCAB)
+        result = (rows if all_logits else rows[-1]).copy()
+        return (result, states) if collect_states else result
 
-    def forward(self, ids, pos_start=0, collect_states=False, stop_after=None):
+    def forward(self, ids, pos_start=0, collect_states=False, stop_after=None,
+                all_logits=False):
         """Run ids (list) at positions pos_start..; cache K/V; return last logits.
 
         Batched submission: all GPU dispatches between two CPU-dependency points
         (attention reads) are recorded into ONE command buffer. Per token this is
-        ~37 submits instead of one per op (~500)."""
+        ~37 submits instead of one per op (~500). all_logits=True returns [M,V],
+        whose row i predicts the token AFTER ids[i]."""
+        ids = self._prepare_forward(ids, pos_start)
         gpu, s = self.gpu, self.s
         M, H = len(ids), self.H
         T = pos_start + M
         h = s["ra"]
         h.upload(self._embed_f16()[np.asarray(ids)].astype(np.float32))
-        causal = (pos_start == 0 and M > 1)
+        causal = M > 1
+        features = {}
         jobs = []
         states = None
         if collect_states:
@@ -313,10 +360,14 @@ class Qwen3Engine:
                                           bT=True, out=s["dn"])[0])
             h = s["ra"]
             jobs.append(gpu.job_add(s["rb"], s["dn"], M * H, out=h)[0])
-            if collect_states:
+            if collect_states or li in self._feature_layers:
                 gpu.dev.submit_jobs(jobs)
                 jobs = []
-                states.append(h.np(np.float32, count=M * H).reshape(M, H).copy())
+                state = h.np(np.float32, count=M * H).reshape(M, H).copy()
+                if collect_states:
+                    states.append(state)
+                if li in self._feature_layers:
+                    features[li] = state
 
         # ---- final norm + lm_head on all M rows (read last row of logits) ----
         if stop_after is not None:
@@ -330,11 +381,20 @@ class Qwen3Engine:
                 gpu.dev.submit_jobs([jb])
         else:
             gpu.dev.submit_jobs(jobs)
-        return self.logits_buf.np(np.float32, count=M * VOCAB) \
-            .reshape(M, VOCAB)[M - 1].copy()
+        self.cache_length = T
+        if self._feature_layers:
+            self.last_features = np.concatenate([features[li] for li in self._feature_layers], axis=-1)
+        rows = self.logits_buf.np(np.float32, count=M * VOCAB).reshape(M, VOCAB)
+        return (rows if all_logits else rows[-1]).copy()
 
     def generate(self, prompt_ids, max_new=128, temperature=0.7, top_p=0.8,
-                 rng=None, eos=IM_END, callback=None):
+                 rng=None, eos=IM_END, callback=None, speculative_ngram=False):
+        if speculative_ngram:
+            if temperature != 0:
+                raise ValueError("n-gram speculation currently requires temperature=0")
+            from speculative import generate_greedy
+            return generate_greedy(self, prompt_ids, max_new=max_new, eos=eos,
+                                   callback=callback)
         rng = rng or np.random.default_rng()
         self.clear_cache()
         ids = list(prompt_ids)
@@ -353,6 +413,8 @@ class Qwen3Engine:
 
 
 def sample(logits, temperature=0.7, top_p=0.8, rng=None):
+    if temperature == 0:
+        return int(np.argmax(logits))
     rng = rng or np.random.default_rng()
     l = logits.astype(np.float64)
     l -= l.max()

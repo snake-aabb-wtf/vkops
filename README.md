@@ -163,6 +163,55 @@ intentionally not committed — pull it from any Vulkan SDK 1.4.x install.
 - If activation buffers are freed/reallocated while their descriptor sets
   are cached, recycled handles can silently alias old bindings — preallocate.
 
+## Optional greedy speculative decoding (Vega 8)
+
+`Qwen3Engine.forward(..., all_logits=True)` returns one logit row per input
+token. Incremental multi-token calls are causal; `cache_length` and
+`truncate_cache(length)` support rejection/rollback. Invalid cache positions or
+context overflow are rejected before GPU work.
+
+For repeated text/code, a model-free n-gram draft is available explicitly:
+
+```python
+tokens = engine.generate(prompt_ids, temperature=0, max_new=64,
+                         speculative_ngram=True)
+```
+
+The API accepts the same opt-in JSON field:
+
+```json
+{"messages":[{"role":"user","content":"Repeat this sentence..."}],
+ "temperature":0,"max_tokens":64,"speculative_ngram":true}
+```
+
+It is **not enabled by default** and currently rejects nonzero temperature.
+Ordinary sampling defaults remain unchanged. Repeated text benefits most;
+ordinary conversation can see little benefit. Every proposal is verified by
+the target. Floating-point batch shapes can differ near logit ties, so this is
+not a guarantee of bitwise-identical output for every possible prompt.
+
+Transposed FP16 GEMMs with 2–8 rows now reuse weights across rows with FP32
+accumulation. This also improves ordinary short prefills, whose logits can
+differ slightly from the previous FP16-slice accumulator. Set
+`VKOPS_DISABLE_SMALL_GEMM=1` to select the previous matrix kernel; the existing
+`VKOPS_DISABLE_GEMV=1` controls the separate single-row kernel.
+
+Tests and measurements:
+
+```text
+python -m unittest test_verifier test_speculative test_server_speculative
+python test_small_gemm.py
+python test_model_verifier.py
+python bench_speculative.py
+python bench_ngram.py
+```
+
+Full-model commands use existing local weights and require
+the target Vulkan device. Known-token verifier throughput is an upper bound,
+not an achieved speculative-generation throughput.
+Measured results and limitations are in
+[the speculative decoding report](SPECULATIVE_REPORT_20261117.md).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

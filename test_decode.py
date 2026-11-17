@@ -34,7 +34,7 @@ def main():
    except ValueError:pass
    else:raise AssertionError('missing FP16 shape validation')
  # Original matrix kernel remains the fallback for prefill and non-transposed B.
- for m,n,k,bt in [(2,65,96,True),(1,68,96,False),(7,64,32,False)]:
+ for m,n,k,bt in [(9,65,96,True),(1,68,96,False),(7,64,32,False)]:
   a=rng.standard_normal((m,k)).astype(np.float16)*.1
   b=rng.standard_normal((n,k) if bt else (k,n)).astype(np.float16)*.1
   aa=gpu.tensor_f16(a);bb=gpu.tensor_f16(b);out=gpu.empty(m*n*4);keep.extend((aa,bb,out))
