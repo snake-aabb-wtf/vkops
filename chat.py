@@ -116,21 +116,22 @@ def rmsnorm_np(x, w, eps=EPS):
 
 
 def attention_np(q, k, v, M, T, causal):
-    """q [M, Hq*d] roped/normalized; k, v full caches [T, Hkv*d]; returns [M, Hq*d]."""
-    qh = q.reshape(M, HEADS, HEAD_DIM)
-    out = np.empty((M, HEADS * HEAD_DIM), np.float32)
-    scale = 1.0 / math.sqrt(HEAD_DIM)
-    for hq in range(HEADS):
-        kvh = hq // (HEADS // KV_HEADS)
-        s = qh[:, hq, :] @ k[:T, kvh * HEAD_DIM:(kvh + 1) * HEAD_DIM].T * scale
-        if causal:
-            s += np.triu(np.full((M, T), -1e30, np.float32), T - M + 1)
-        s -= s.max(-1, keepdims=True)
-        wgt = np.exp(s)
-        wgt /= wgt.sum(-1, keepdims=True)
-        out[:, hq * HEAD_DIM:(hq + 1) * HEAD_DIM] = \
-            wgt @ v[:T, kvh * HEAD_DIM:(kvh + 1) * HEAD_DIM]
-    return out.reshape(M, HEADS * HEAD_DIM)
+    # Group the four Q heads sharing each KV head into one GEMM.
+    group = HEADS // KV_HEADS
+    qh = q.reshape(M, KV_HEADS, group, HEAD_DIM).transpose(1, 0, 2, 3)
+    qh = qh.reshape(KV_HEADS, M * group, HEAD_DIM)
+    kh = k[:T].reshape(T, KV_HEADS, HEAD_DIM).transpose(1, 2, 0)
+    vh = v[:T].reshape(T, KV_HEADS, HEAD_DIM).transpose(1, 0, 2)
+    scores = (qh @ kh).reshape(KV_HEADS, M, group, T)
+    scores *= 1.0 / math.sqrt(HEAD_DIM)
+    if causal:
+        mask = np.triu(np.full((M, T), -1e30, np.float32), T - M + 1)
+        scores += mask[None, :, None, :]
+    scores -= scores.max(-1, keepdims=True)
+    np.exp(scores, out=scores)
+    scores /= scores.sum(-1, keepdims=True)
+    out = scores.reshape(KV_HEADS, M * group, T) @ vh
+    return out.reshape(KV_HEADS, M, group, HEAD_DIM).transpose(1, 0, 2, 3).reshape(M, HEADS * HEAD_DIM).astype(np.float32, copy=False)
 
 
 # ----------------------------------------------------------------- engine ----
@@ -172,7 +173,7 @@ class Qwen3Engine:
         self.s = {
             "xn": gpu.empty(f32h), "x16": gpu.empty(f16h), "x216": gpu.empty(f16h),
             "q": gpu.empty(qn), "k": gpu.empty(kvn), "v": gpu.empty(kvn),
-            "att": gpu.empty(qn), "att16": gpu.empty(f16h), "o": gpu.empty(f32h),
+            "att": gpu.empty(qn), "att16": gpu.empty(qn // 2), "o": gpu.empty(f32h),
             "ra": gpu.empty(f32h), "rb": gpu.empty(f32h),
             "g": gpu.empty(f32i), "u": gpu.empty(f32i),
             "a": gpu.empty(f32i), "a16": gpu.empty(f16i), "dn": gpu.empty(f32h),

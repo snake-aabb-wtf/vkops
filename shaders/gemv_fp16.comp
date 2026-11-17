@@ -1,0 +1,33 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// A[1,K] * B[N,K]^T -> D[1,N]. Eight rows/workgroup, 32 lanes/row.
+// FP16 storage and FP32 accumulation; no weight repacking required.
+#define LANES 32u
+#define ROWS (256u / LANES)
+layout(local_size_x = 256) in;
+layout(std430, set = 0, binding = 0) readonly buffer BufA { f16vec4 a[]; };
+layout(std430, set = 0, binding = 1) readonly buffer BufB { f16vec4 b[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer BufD { float d[]; };
+layout(push_constant) uniform Push { uvec4 dims; vec4 flags; } pc;
+shared float sums[256];
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint lane = tid % LANES;
+    uint row = gl_WorkGroupID.x * ROWS + tid / LANES;
+    uint k4 = pc.dims.z >> 2u;
+    vec4 acc = vec4(0.0);
+    if (row < pc.dims.y) {
+        for (uint k = lane; k < k4; k += LANES) {
+            acc = fma(vec4(a[k]), vec4(b[row * k4 + k]), acc);
+        }
+    }
+    sums[tid] = (acc.x + acc.y) + (acc.z + acc.w);
+    barrier();
+    for (uint stride = LANES / 2u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) sums[tid] += sums[tid + stride];
+        barrier();
+    }
+    if (lane == 0u && row < pc.dims.y) d[row] = sums[tid];
+}

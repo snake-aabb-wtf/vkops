@@ -26,6 +26,7 @@ SHADER_FILES = {
     "gemm": "gemm.comp",
     "gemm_v2": "gemm_v2.comp",
     "gemm_fp16": "gemm_fp16.comp",
+    "gemv_fp16": "gemv_fp16.comp",
     "cvt_f32_f16": "cvt_f32_f16.comp",
     "rmsnorm_f16": "rmsnorm_f16.comp",
     "silu_mul_f16": "silu_mul_f16.comp",
@@ -82,7 +83,7 @@ class GPU:
         return buf.np(np.float32, count=int(np.prod(shape))).reshape(shape).copy()
 
     # -- pipelines ----------------------------------------------------------
-    FP16_PIPELINES = ("gemm_fp16", "cvt_f32_f16", "rmsnorm_f16", "silu_mul_f16")
+    FP16_PIPELINES = ("gemm_fp16", "gemv_fp16", "cvt_f32_f16", "rmsnorm_f16", "silu_mul_f16")
 
     def _pipeline(self, name, nbind):
         if name in self.FP16_PIPELINES and not self.dev.fp16_enabled:
@@ -111,8 +112,16 @@ class GPU:
 
     # -- job builders (no submit; compose lists for batched submits) ---------
     def job_gemm_fp16(self, A, B, M, N, K, bT=False, out=None):
+        if K % 32:
+            raise ValueError(f"gemm_fp16 requires K % 32 == 0 (got K={K})")
+        if not bT and N % 4:
+            raise ValueError(f"gemm_fp16 requires N % 4 == 0 when bT=False (got N={N})")
         if out is None:
             out = self.dev.alloc(M * N * 4)
+        if M == 1 and bT and N <= 8 * 65535 and os.environ.get("VKOPS_DISABLE_GEMV") != "1":
+            return {"pipeline": self._pipeline("gemv_fp16", 3),
+                    "buffers": [A, B, out], "push": _push(M, N, K),
+                    "gx": _ceil_div(N, 8)}, out
         return {"pipeline": self._pipeline("gemm_fp16", 3),
                 "buffers": [A, B, out],
                 "push": _push(M, N, K, 0, 0.0, 1.0 if bT else 0.0),
@@ -206,18 +215,8 @@ class GPU:
     def gemm_fp16(self, A16, B16, M, N, K, bT=False, out=None):
         """Packed-FP16 GEMM: D[M,N] = A16[M,K] @ B16, f32 output.
         Requires K % 32 == 0; additionally N % 4 == 0 when bT=False."""
-        if K % 32:
-            raise ValueError(f"gemm_fp16 requires K % 32 == 0 (got K={K})")
-        if not bT and N % 4:
-            raise ValueError(f"gemm_fp16 requires N % 4 == 0 when bT=False (got N={N})")
-        if out is None:
-            out = self.dev.alloc(M * N * 4)
-        pl = self._pipeline("gemm_fp16", 3)
-        self.dev.submit_jobs([{
-            "pipeline": pl, "buffers": [A16, B16, out],
-            "push": _push(M, N, K, 0, 0.0, 1.0 if bT else 0.0),
-            "gx": _ceil_div(N, 64), "gy": _ceil_div(M, 64), "gz": 1,
-        }])
+        job, out = self.job_gemm_fp16(A16, B16, M, N, K, bT=bT, out=out)
+        self.dev.submit_jobs([job])
         return out
 
     def ffn_block_fp16(self, x, w_norm, w_gate16, w_up16, w_down16,
