@@ -212,6 +212,43 @@ not an achieved speculative-generation throughput.
 Measured results and limitations are in
 [the speculative decoding report](SPECULATIVE_REPORT_20261117.md).
 
+## Optional experimental DFlash1
+
+An independent NumPy/Vulkan adapter supports the MIT
+[`z-lab/Qwen3-4B-DFlash-b16`](https://huggingface.co/z-lab/Qwen3-4B-DFlash-b16)
+checkpoint. It is trained for a different Qwen3-4B variant: measured gains are
+workload dependent. The Fibonacci code test nearly doubled; explanation and
+Chinese tests became slightly slower. It is **off by default**.
+
+To make it available to the API, put its `config.json` and `model.safetensors`
+in a local directory, then configure that directory before starting the server:
+
+```powershell
+$env:VKOPS_DFLASH_MODEL = 'C:\models\Qwen3-4B-DFlash-b16'
+python server.py
+```
+
+No automatic download or checkpoint Python execution occurs. Do not set
+`VKOPS_DISABLE_GEMV=1` or `VKOPS_DISABLE_SMALL_GEMM=1` together with DFlash.
+Requests explicitly choose the B4/verify4 greedy experiment:
+
+```json
+{"messages":[{"role":"user","content":"Write a Python Fibonacci function."}],
+ "temperature":0,"max_tokens":64,"speculative_dflash":true}
+```
+
+Only one speculative mode can be enabled per request. Ordinary requests still
+use the original generation path. The library also exposes
+`dflash_draft.generate_dflash` for explicit block-size experiments.
+
+```text
+python -m unittest test_dflash_draft test_server_speculative
+python bench_dflash.py --draft-model C:\models\Qwen3-4B-DFlash-b16 --cpu-reference
+```
+
+See [the DFlash report](DFLASH_REPORT_20261117.md) for numerical checks, exact
+measurements, memory/latency tradeoffs and the target-variant limitation.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
